@@ -1,0 +1,15 @@
+vendor/*
+!vendor/.gitkeep
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+reports/*.xml
+*.kubeconfig
+vault/.data/
+vault/init.json
+bin/
+docker/monitoring/prometheus
+docker/monitoring/promtool
+docker/monitoring/alertmanager
+docker/monitoring/*-linux-amd64

@@ -1,0 +1,98 @@
+# End-to-end delivery pipeline: commit -> quality gates -> security -> image -> canary to Kubernetes
+name: ci-cd
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/taskapi
+
+jobs:
+  lint-and-unit-test:
+    name: Gate 1 - lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements-dev.txt
+      - run: flake8 app tests
+      - run: pytest tests/test_unit.py --cov=app --cov-fail-under=85 --junitxml=reports/unit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: unit-test-report, path: reports/ }
+
+  security-scan:
+    name: Gate 2 - security (SAST, dependencies, IaC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install bandit pip-audit checkov
+      - name: SAST - Bandit
+        run: bandit -r app -ll
+      - name: Dependency CVEs - pip-audit
+        run: pip-audit -r requirements.txt --strict
+      - name: IaC gate - application workloads (blocking)
+        # CKV_K8S_35 accepted: DATABASE_URL needs the password as env var; secret comes from the vault, rotated
+        run: checkov -f k8s/base/30-app.yaml -f k8s/base/60-network-policy.yaml --framework kubernetes --config-file .checkov.yaml --skip-check CKV_K8S_35,CKV_K8S_43,CKV_K8S_15
+      - name: IaC report - whole platform + Dockerfile + workflows (non-blocking backlog)
+        run: checkov -d . --framework kubernetes,dockerfile,github_actions --config-file .checkov.yaml --soft-fail
+
+  build-and-integration-test:
+    name: Gate 3 - build image + integration tests (PostgreSQL)
+    needs: [lint-and-unit-test, security-scan]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: taskapi, POSTGRES_PASSWORD: ci-only-password, POSTGRES_DB: tasks }
+        options: --health-cmd "pg_isready -U taskapi" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --build-arg APP_VERSION=${{ github.sha }} -t $IMAGE:${{ github.sha }} .
+      - name: Run container against PostgreSQL
+        run: |
+          docker run -d --name api --network host \
+            -e DATABASE_URL=postgresql://taskapi:ci-only-password@127.0.0.1:5432/tasks $IMAGE:${{ github.sha }}
+          for i in $(seq 1 30); do curl -sf localhost:8000/readyz && break; sleep 1; done
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-dev.txt
+      - run: BASE_URL=http://localhost:8000 pytest tests/test_integration.py -v
+      - name: Push image to GHCR (main only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }} && docker push $IMAGE:latest
+
+  deploy-canary:
+    name: Deploy - canary rollout to Kubernetes
+    needs: build-and-integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production          # manual approval + protected secrets
+    env:
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip when no cluster is configured
+        if: env.KUBECONFIG_DATA == ''
+        run: echo "::notice::KUBECONFIG secret not set - deploy step skipped (see README for local cluster)"
+      - name: Progressive canary with automated Prometheus analysis
+        if: env.KUBECONFIG_DATA != ''
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig && export KUBECONFIG=$PWD/kubeconfig
+          pip install requests
+          python3 scripts/canary_rollout.py --image $IMAGE:${{ github.sha }} --version ${{ github.sha }}

@@ -1,0 +1,11 @@
+.git
+.github
+tests
+k8s
+ansible
+docs
+scripts
+vault
+*.md
+__pycache__
+.venv
